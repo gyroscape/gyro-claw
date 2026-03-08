@@ -1,0 +1,65 @@
+# SECURITY FIX: Removed deprecated `version` key (Docker Compose v2+ ignores it).
+services:
+  gyro-claw:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gyro-claw
+    ports:
+      - "3000:3000"
+    volumes:
+      # Persist vault and memory data
+      - gyro-data:/home/gyroclaw/.gyro-claw
+      # Mount source for development (optional)
+      - ./src:/app/src:ro
+    environment:
+      # Set your LLM API key here
+      - GYROSCAPE_API_KEY=${GYROSCAPE_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - GYRO_CLAW_VAULT_PASSWORD=${GYRO_CLAW_VAULT_PASSWORD:-}
+      # Optional: Telegram integration
+      # - TELOXIDE_TOKEN=${TELOXIDE_TOKEN:-}
+      # - TELEGRAM_ALLOWED_USER_ID=${TELEGRAM_ALLOWED_USER_ID:-}
+      # Optional: Playwright server endpoint
+      # - GYRO_CLAW_PLAYWRIGHT_ENDPOINT=${GYRO_CLAW_PLAYWRIGHT_ENDPOINT:-}
+      - RUST_LOG=gyro_claw=info
+    restart: unless-stopped
+
+  # Development service with cargo watch (optional)
+  gyro-claw-dev:
+    image: rust:1.77-bookworm
+    container_name: gyro-claw-dev
+    working_dir: /app
+    volumes:
+      - .:/app
+      - cargo-cache:/usr/local/cargo/registry
+      - target-cache:/app/target
+      - gyro-data-dev:/root/.gyro-claw
+    environment:
+      - GYROSCAPE_API_KEY=${GYROSCAPE_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - GYRO_CLAW_VAULT_PASSWORD=${GYRO_CLAW_VAULT_PASSWORD:-}
+      # Optional: Telegram integration
+      # - TELOXIDE_TOKEN=${TELOXIDE_TOKEN:-}
+      # - TELEGRAM_ALLOWED_USER_ID=${TELEGRAM_ALLOWED_USER_ID:-}
+      # Optional: Playwright server endpoint
+      # - GYRO_CLAW_PLAYWRIGHT_ENDPOINT=${GYRO_CLAW_PLAYWRIGHT_ENDPOINT:-}
+      - RUST_LOG=gyro_claw=debug
+    ports:
+      - "3001:3000"
+    command: >
+      bash -c "
+        cargo build &&
+        echo '✅ Build successful. Starting server...' &&
+        cargo run -- serve
+      "
+    profiles:
+      - dev
+
+volumes:
+  gyro-data:
+  gyro-data-dev:
+  cargo-cache:
+  target-cache:

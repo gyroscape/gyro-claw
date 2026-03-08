@@ -1,0 +1,7 @@
+/target
+/.env
+/memory.db*
+/workspace/
+!/workspace/.gitkeep
+/playwright-server/node_modules/
+.DS_Store

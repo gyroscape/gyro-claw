@@ -1,0 +1,89 @@
+[package]
+name = "gyro-claw"
+version = "0.1.0"
+edition = "2021"
+description = "A lightweight, privacy-first AI automation agent"
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Web API
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+
+# HTTP client (LLM + HTTP tool)
+reqwest = { version = "0.12", features = ["json", "gzip", "brotli", "deflate", "rustls-tls"] }
+scraper = "0.18"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# JSON Schema for tool input descriptions
+schemars = "0.8"
+
+# SQLite for memory
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Encryption (vault)
+aes-gcm = "0.10"
+argon2 = "0.5"
+rand = "0.8"
+sha2 = "0.10"
+hmac = "0.12"
+hkdf = "0.12"
+zeroize = "1.7"
+dashmap = "5"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
+
+# Error handling
+anyhow = "1"
+
+# Async trait support
+async-trait = "0.1"
+futures = "0.3"
+
+# UUID generation
+uuid = { version = "1", features = ["v4"] }
+
+# Chrono for timestamps
+chrono = { version = "0.4", features = ["serde"] }
+
+# Home directory resolution
+dirs = "5"
+
+# Config file parsing
+toml = "0.8"
+
+# Directory traversal (project_map, search)
+walkdir = "2"
+
+# Glob pattern matching (search tool)
+glob = "0.3"
+
+# Diff generation (edit tool preview)
+similar = "2.6"
+
+# CLI styling for diffs and streaming output
+console = "0.15"
+
+# Telegram Bot
+teloxide = { version = "0.13", features = ["macros"] }
+
+# Browser Automation
+headless_chrome = { version = "1.0", features = ["fetch"] }
+
+# Computer Control
+enigo = "0.2"
+screenshots = "0.8"
+base64 = "0.22"
+image = "0.24"
