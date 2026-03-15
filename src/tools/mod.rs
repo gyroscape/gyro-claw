@@ -19,6 +19,9 @@ pub mod test_runner;
 pub mod wait;
 pub mod web_fetch;
 pub mod web_search;
+pub mod sub_agents;
+pub mod skills;
+pub mod skills_tool;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -118,6 +121,54 @@ impl ToolRegistry {
     pub fn tool_names(&self) -> Vec<String> {
         self.tools.keys().cloned().collect()
     }
+
+    /// Suggest tool names close to a requested name.
+    pub fn suggest_tools(&self, name: &str, limit: usize) -> Vec<String> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+
+        let mut scored: Vec<(usize, String)> = self
+            .tools
+            .keys()
+            .map(|tool_name| (levenshtein(trimmed, tool_name), tool_name.clone()))
+            .collect();
+
+        scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        scored.into_iter().take(limit).map(|(_, name)| name).collect()
+    }
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    if a == b {
+        return 0;
+    }
+    if a.is_empty() {
+        return b.chars().count();
+    }
+    if b.is_empty() {
+        return a.chars().count();
+    }
+
+    let b_len = b.chars().count();
+    let mut prev_row: Vec<usize> = (0..=b_len).collect();
+    let mut curr_row = vec![0; b_len + 1];
+
+    for (i, ca) in a.chars().enumerate() {
+        curr_row[0] = i + 1;
+        let mut prev_diag = i;
+        for (j, cb) in b.chars().enumerate() {
+            let insert_cost = curr_row[j] + 1;
+            let delete_cost = prev_row[j + 1] + 1;
+            let replace_cost = if ca == cb { prev_diag } else { prev_diag + 1 };
+            prev_diag = prev_row[j + 1];
+            curr_row[j + 1] = insert_cost.min(delete_cost).min(replace_cost);
+        }
+        prev_row.clone_from_slice(&curr_row);
+    }
+
+    prev_row[b_len]
 }
 
 impl Default for ToolRegistry {

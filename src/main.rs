@@ -58,6 +58,13 @@ use crate::vault::telemetry::{
     AnomalyDetector, SecretAccessEvent, SecretRateLimiter, VaultSession,
 };
 
+use crate::tools::sub_agents::{SubAgentFactory, SubAgentRole};
+use crate::tools::sub_agents::researcher::ResearcherAgentTool;
+use crate::tools::sub_agents::coder::CoderAgentTool;
+use crate::tools::sub_agents::browser::BrowserAgentTool;
+use crate::tools::skills::SkillManager;
+use crate::tools::skills_tool::SkillsTool;
+
 /// Gyro-Claw: A lightweight, privacy-first AI automation agent
 #[derive(Parser)]
 #[command(name = "gyro-claw")]
@@ -251,7 +258,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             if background {
                 let (_, _, memory, _) =
-                    setup_components(&cli.provider, &cli.model, &config, cli.no_sandbox)?;
+                    setup_components(&cli.provider, &cli.model, &config, cli.no_sandbox, 0, None)?;
                 let id = memory.enqueue_task(&command)?;
                 println!(
                     "✅ Task queued with ID: #{}. Run `gyro-claw task status {}` or `gyro-claw worker`.",
@@ -261,7 +268,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let (mut planner, tool_registry) =
-                setup_agent(&cli.provider, &cli.model, &config, cli.no_sandbox)?;
+                setup_agent(&cli.provider, &cli.model, &config, cli.no_sandbox, 0, None)?;
             let result = planner.run(&command, &tool_registry).await?;
             println!("\n{}", result);
         }
@@ -276,7 +283,7 @@ async fn main() -> anyhow::Result<()> {
             }
             if background {
                 let (_, _, memory, _) =
-                    setup_components(&cli.provider, &cli.model, &config, cli.no_sandbox)?;
+                    setup_components(&cli.provider, &cli.model, &config, cli.no_sandbox, 0, None)?;
                 let id = memory.enqueue_task(&command)?;
                 println!(
                     "✅ AutoFix task queued with ID: #{}. Run `gyro-claw task status {}` or `gyro-claw worker`.",
@@ -286,7 +293,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let (mut planner, tool_registry) =
-                setup_agent(&cli.provider, &cli.model, &config, cli.no_sandbox)?;
+                setup_agent(&cli.provider, &cli.model, &config, cli.no_sandbox, 0, None)?;
 
             if config.mode != "autonomous" {
                 println!("⚠️ Warning: Running Auto-Fix in '{}' mode. You will be prompted for file edits and test runs.", config.mode);
@@ -300,7 +307,7 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Worker => {
             let (_, _, memory, _) =
-                setup_components(&cli.provider, &cli.model, &config, cli.no_sandbox)?;
+                setup_components(&cli.provider, &cli.model, &config, cli.no_sandbox, 0, None)?;
 
             let factory = CliAgentFactory {
                 provider: cli.provider.clone(),
@@ -315,7 +322,7 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Task { action } => {
             let (_, _, memory, _) =
-                setup_components(&cli.provider, &cli.model, &config, cli.no_sandbox)?;
+                setup_components(&cli.provider, &cli.model, &config, cli.no_sandbox, 0, None)?;
             match action {
                 TaskCommands::Add { goal } => {
                     let id = memory.enqueue_task(&goal)?;
@@ -382,7 +389,7 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Logs { limit } => {
             let (_, _, memory, _) =
-                setup_components(&cli.provider, &cli.model, &config, cli.no_sandbox)?;
+                setup_components(&cli.provider, &cli.model, &config, cli.no_sandbox, 0, None)?;
             let logs = memory.get_tool_logs(limit)?;
             if logs.is_empty() {
                 println!("📜 No agent activity logs found.");
@@ -408,7 +415,7 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Index { dir } => {
             let (llm_client, _, memory, _) =
-                setup_components(&cli.provider, &cli.model, &config, cli.no_sandbox)?;
+                setup_components(&cli.provider, &cli.model, &config, cli.no_sandbox, 0, None)?;
             let indexer = SemanticIndexer::new(memory, llm_client);
 
             println!("🧠 Building Codebase Semantic Index... This may take a moment depending on the project size and API rate limits.");
@@ -421,7 +428,7 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Bot { platform } => {
             let (_llm_client, _, memory, _executor) =
-                setup_components(&cli.provider, &cli.model, &config, cli.no_sandbox)?;
+                setup_components(&cli.provider, &cli.model, &config, cli.no_sandbox, 0, None)?;
 
             // Set up and start the background worker inherently alongside the bot listener
             let factory = CliAgentFactory {
@@ -455,7 +462,7 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Chat => {
             let (mut planner, tool_registry) =
-                setup_agent(&cli.provider, &cli.model, &config, cli.no_sandbox)?;
+                setup_agent(&cli.provider, &cli.model, &config, cli.no_sandbox, 0, None)?;
             println!("🤖 Gyro-Claw Interactive Chat (mode: {})", config.mode);
             println!("Type 'exit' or 'quit' to leave.\n");
 
@@ -486,7 +493,7 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Serve => {
             let (llm, executor, memory, tool_registry) =
-                setup_components(&cli.provider, &cli.model, &config, cli.no_sandbox)?;
+                setup_components(&cli.provider, &cli.model, &config, cli.no_sandbox, 0, None)?;
             api::server::start_server(
                 llm,
                 executor,
@@ -629,7 +636,80 @@ struct CliAgentFactory {
 
 impl AgentFactory for CliAgentFactory {
     fn create_agent(&self) -> anyhow::Result<(Planner, crate::tools::ToolRegistry)> {
-        setup_agent(&self.provider, &self.model, &self.config, self.no_sandbox)
+        setup_agent(&self.provider, &self.model, &self.config, self.no_sandbox, 0, None)
+    }
+}
+
+pub struct AppSubAgentFactory {
+    pub provider: String,
+    pub model: String,
+    pub config: Config,
+    pub no_sandbox: bool,
+    pub depth: usize,
+}
+
+#[async_trait::async_trait]
+impl SubAgentFactory for AppSubAgentFactory {
+    async fn run_sub_agent(
+        &self,
+        role: SubAgentRole,
+        instruction: &str,
+    ) -> std::result::Result<String, String> {
+        let mut role_config = self.config.clone();
+        if let SubAgentRole::Coder = role {
+            // Give the coding sub-agent higher operational ceilings for large builds.
+            role_config.max_tool_calls = role_config.max_tool_calls.max(500);
+            role_config.max_iterations = role_config.max_iterations.max(120);
+            role_config.execution.max_task_runtime_seconds =
+                role_config.execution.max_task_runtime_seconds.max(7200);
+            role_config.execution.max_shell_runtime_seconds =
+                role_config.execution.max_shell_runtime_seconds.max(7200);
+        }
+
+        let (mut planner, registry) = setup_agent(
+            &self.provider,
+            &self.model,
+            &role_config,
+            self.no_sandbox,
+            self.depth + 1,
+            Some(role),  // SECURITY: Pass role to restrict tool registry
+        )
+        .map_err(|e| e.to_string())?;
+
+        // Limit the sub-agent so it doesn't run forever (role-based limits).
+        let (max_iterations, max_seconds) = match role {
+            SubAgentRole::Coder => (120, 7200),
+            SubAgentRole::Researcher => (20, 600),
+            SubAgentRole::Browser => (20, 600),
+        };
+        planner.set_limits(max_iterations, max_seconds);
+
+        let system_message = match role {
+            SubAgentRole::Researcher => "You are a Research Sub-Agent. Your strictly isolated role is to search for information and read files. You cannot mutate state.",
+            SubAgentRole::Coder => "You are a Coder Sub-Agent — a production-grade software engineer. \
+             Your role: read code, edit files, implement features/fixes, and run tests. Use shell tools for scaffolding, installs, and builds when appropriate. \
+             RULES: Use tools precisely — follow schemas, read outputs carefully, and never fabricate results. \
+             Inspect relevant files before editing; keep changes minimal and coherent. \
+             Write COMPLETE, WORKING code with proper error handling and input validation; no TODOs or stubs. \
+             Follow existing project conventions (structure, style, dependencies). For UI, match the current design system; \
+             do not impose a new theme unless asked. Ensure accessibility and responsive layouts. \
+             DEFINITION OF DONE: deliver a complete, runnable project. For new builds, include README/setup/run steps, package configs, scripts, sample data, and any referenced assets. \
+             Visual polish matters: establish a clear visual direction (palette, typography, spacing, components), style all UI states, and avoid unstyled defaults. \
+             For multi-file output, create every referenced file, verify they exist, and re-read key files to confirm content. \
+             Prefer maintainable, secure solutions; add or update tests when appropriate. \
+             If tests fail, diagnose, fix, and re-run. If blocked, explain the issue and propose next steps. \
+             Output must be production-worthy and aligned with the instruction.",
+            SubAgentRole::Browser => "You are a Browser Sub-Agent. Your strictly isolated role is to use the browser tools to navigate the web and extract data safely. You cannot touch the local filesystem.",
+        };
+
+        // We run with an explicit prepended message. (In a full implementation, you'd modify Planner's system prompt)
+        let prompt = format!("{}\n\nINSTRUCTION: {}", system_message, instruction);
+
+        // Run the sub-agent
+        planner
+            .run(&prompt, &registry)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -639,9 +719,11 @@ fn setup_agent(
     model: &str,
     config: &Config,
     no_sandbox: bool,
+    agent_depth: usize,
+    role_override: Option<SubAgentRole>,
 ) -> anyhow::Result<(Planner, ToolRegistry)> {
     let (llm, executor, memory, tool_registry) =
-        setup_components(provider, model, config, no_sandbox)?;
+        setup_components(provider, model, config, no_sandbox, agent_depth, role_override)?;
     let planner = Planner::new(llm, executor, memory, config.clone());
     Ok((planner, tool_registry))
 }
@@ -652,6 +734,8 @@ fn setup_components(
     model: &str,
     config: &Config,
     no_sandbox: bool,
+    agent_depth: usize,
+    role_override: Option<SubAgentRole>, // If Some, restricts registered tools
 ) -> anyhow::Result<(LlmClient, Executor, Memory, ToolRegistry)> {
     // Determine LLM backend
     let backend = match provider.to_lowercase().as_str() {
@@ -696,66 +780,129 @@ fn setup_components(
 
     // Register ALL tools
     let mut tool_registry = ToolRegistry::new();
-    tool_registry.register(Box::new(ShellTool::new(
-        config.execution.max_shell_runtime_seconds,
-    )));
-    tool_registry.register(Box::new(FilesystemTool::new(
-        config.sandbox.workspace.clone(),
-    )));
-    tool_registry.register(Box::new(HttpTool::new()));
-    tool_registry.register(Box::new(SearchTool::new()));
-    tool_registry.register(Box::new(EditTool::new(config.sandbox.workspace.clone())));
-    tool_registry.register(Box::new(ProjectMapTool::new()));
-    tool_registry.register(Box::new(GitTool::new()));
-    tool_registry.register(Box::new(WebSearchTool::new()));
-    tool_registry.register(Box::new(WebFetchTool::new()));
-    tool_registry.register(Box::new(TestRunnerTool::new()));
-    tool_registry.register(Box::new(WaitTool::new()));
-    tool_registry.register(Box::new(BrowserTool::new(
-        config.execution.max_browser_requests,
-        config.browser.clone(),
-        config.sandbox.workspace.clone(),
-        llm.clone(),
-    )));
-    tool_registry.register(Box::new(SemanticSearchTool::new(SemanticIndexer::new(
-        memory.clone(),
-        llm.clone(),
-    ))));
-    tool_registry.register(Box::new(PlaywrightTool::new()));
 
-    if config.computer_control.enabled {
-        tool_registry.register(Box::new(
-            crate::tools::computer::screenshot::ScreenshotTool::new(&config.sandbox.workspace),
-        ));
-        tool_registry.register(Box::new(crate::tools::computer::mouse::MouseTool::new()));
-        tool_registry.register(Box::new(
-            crate::tools::computer::keyboard::KeyboardTool::new(),
-        ));
-        tool_registry.register(Box::new(crate::tools::computer::system::SystemTool::new(
-            config.computer_control.allowed_apps.clone(),
-        )));
-        tool_registry.register(Box::new(
-            crate::tools::computer::screen_diff::ScreenDiffTool::new(
-                &config.sandbox.workspace,
-                config.computer_control.screen_change_threshold,
-            ),
-        ));
-        if config.computer_control.ui_detection_enabled {
-            tool_registry.register(Box::new(
-                crate::tools::computer::ui_detector::UiDetectorTool::new(
-                    &config.sandbox.workspace,
-                    llm.clone(),
-                ),
-            ));
+    // Register based on Role Principle of Least Privilege
+    match role_override {
+        Some(SubAgentRole::Researcher) => {
+            tool_registry.register(Box::new(FilesystemTool::new(
+                config.sandbox.workspace.clone(),
+            )));
+            // SECURITY: No HttpTool — researcher should not make arbitrary HTTP requests
+            tool_registry.register(Box::new(SearchTool::new()));
+            tool_registry.register(Box::new(ProjectMapTool::new()));
+            tool_registry.register(Box::new(WebSearchTool::new()));
+            tool_registry.register(Box::new(SemanticSearchTool::new(SemanticIndexer::new(
+                memory.clone(),
+                llm.clone(),
+            ))));
         }
-        tool_registry.register(Box::new(crate::tools::computer::window::WindowTool::new()));
-        tool_registry.register(Box::new(
-            crate::tools::computer::app_state::AppStateTool::new(),
-        ));
-        tool_registry.register(Box::new(
-            crate::tools::computer::cursor::CursorPositionTool::new(),
-        ));
-        tool_registry.register(Box::new(crate::tools::computer::scroll::ScrollTool::new()));
+        Some(SubAgentRole::Coder) => {
+            tool_registry.register(Box::new(ShellTool::new(
+                config.execution.max_shell_runtime_seconds,
+            )));
+            tool_registry.register(Box::new(FilesystemTool::new(
+                config.sandbox.workspace.clone(),
+            )));
+            tool_registry.register(Box::new(EditTool::new(config.sandbox.workspace.clone())));
+            tool_registry.register(Box::new(ProjectMapTool::new()));
+            tool_registry.register(Box::new(GitTool::new()));
+            tool_registry.register(Box::new(SearchTool::new()));
+            tool_registry.register(Box::new(TestRunnerTool::new()));
+            let skill_manager = Arc::new(SkillManager::discover());
+            tool_registry.register(Box::new(SkillsTool::new(skill_manager)));
+        }
+        Some(SubAgentRole::Browser) => {
+            tool_registry.register(Box::new(BrowserTool::new(
+                config.execution.max_browser_requests,
+                config.browser.clone(),
+                config.sandbox.workspace.clone(),
+                llm.clone(),
+            )));
+            tool_registry.register(Box::new(PlaywrightTool::new()));
+        }
+        None => {
+            // Main Agent - gets everything
+            tool_registry.register(Box::new(ShellTool::new(
+                config.execution.max_shell_runtime_seconds,
+            )));
+            tool_registry.register(Box::new(FilesystemTool::new(
+                config.sandbox.workspace.clone(),
+            )));
+            tool_registry.register(Box::new(HttpTool::new()));
+            tool_registry.register(Box::new(SearchTool::new()));
+            tool_registry.register(Box::new(EditTool::new(config.sandbox.workspace.clone())));
+            tool_registry.register(Box::new(ProjectMapTool::new()));
+            tool_registry.register(Box::new(GitTool::new()));
+            tool_registry.register(Box::new(WebSearchTool::new()));
+            tool_registry.register(Box::new(WebFetchTool::new()));
+            tool_registry.register(Box::new(TestRunnerTool::new()));
+            tool_registry.register(Box::new(WaitTool::new()));
+            tool_registry.register(Box::new(BrowserTool::new(
+                config.execution.max_browser_requests,
+                config.browser.clone(),
+                config.sandbox.workspace.clone(),
+                llm.clone(),
+            )));
+            tool_registry.register(Box::new(SemanticSearchTool::new(SemanticIndexer::new(
+                memory.clone(),
+                llm.clone(),
+            ))));
+            tool_registry.register(Box::new(PlaywrightTool::new()));
+
+            // Skills system — discover and register
+            let skill_manager = Arc::new(SkillManager::discover());
+            tool_registry.register(Box::new(SkillsTool::new(skill_manager)));
+
+            if config.computer_control.enabled {
+                tool_registry.register(Box::new(
+                    crate::tools::computer::screenshot::ScreenshotTool::new(&config.sandbox.workspace),
+                ));
+                tool_registry.register(Box::new(crate::tools::computer::mouse::MouseTool::new()));
+                tool_registry.register(Box::new(
+                    crate::tools::computer::keyboard::KeyboardTool::new(),
+                ));
+                tool_registry.register(Box::new(crate::tools::computer::system::SystemTool::new(
+                    config.computer_control.allowed_apps.clone(),
+                )));
+                tool_registry.register(Box::new(
+                    crate::tools::computer::screen_diff::ScreenDiffTool::new(
+                        &config.sandbox.workspace,
+                        config.computer_control.screen_change_threshold,
+                    ),
+                ));
+                if config.computer_control.ui_detection_enabled {
+                    tool_registry.register(Box::new(
+                        crate::tools::computer::ui_detector::UiDetectorTool::new(
+                            &config.sandbox.workspace,
+                            llm.clone(),
+                        ),
+                    ));
+                }
+                tool_registry.register(Box::new(crate::tools::computer::window::WindowTool::new()));
+                tool_registry.register(Box::new(
+                    crate::tools::computer::app_state::AppStateTool::new(),
+                ));
+                tool_registry.register(Box::new(
+                    crate::tools::computer::cursor::CursorPositionTool::new(),
+                ));
+                tool_registry.register(Box::new(crate::tools::computer::scroll::ScrollTool::new()));
+            }
+
+            // Provide sub-agents to the main agent, ONLY if depth < 2 to prevent runaway recursion loops
+            if agent_depth < 2 {
+                let factory = Arc::new(AppSubAgentFactory {
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                    config: config.clone(),
+                    no_sandbox,
+                    depth: agent_depth,
+                });
+
+                tool_registry.register(Box::new(ResearcherAgentTool::new(factory.clone())));
+                tool_registry.register(Box::new(CoderAgentTool::new(factory.clone())));
+                tool_registry.register(Box::new(BrowserAgentTool::new(factory.clone())));
+            }
+        }
     }
 
     Ok((llm, executor, memory, tool_registry))

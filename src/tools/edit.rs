@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use console::{style, Term};
 use serde_json::Value;
 use similar::{ChangeTag, TextDiff};
+use std::path::{Component, Path, PathBuf};
 
 use super::Tool;
 
@@ -33,6 +34,46 @@ pub struct EditTool {
 impl EditTool {
     pub fn new(workspace: String) -> Self {
         Self { workspace }
+    }
+
+    fn resolve_path(&self, raw_path: &str) -> PathBuf {
+        let provided = PathBuf::from(raw_path);
+        if provided.is_absolute() {
+            return provided;
+        }
+
+        let workspace = PathBuf::from(&self.workspace);
+        if Self::is_workspace_prefixed(&provided, &workspace) {
+            provided
+        } else {
+            workspace.join(provided)
+        }
+    }
+
+    fn absolutize_path(path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(path)
+        }
+    }
+
+    fn is_workspace_prefixed(path: &Path, workspace: &Path) -> bool {
+        let normalized_path = Self::normalize_relative(path);
+        let normalized_workspace = Self::normalize_relative(workspace);
+        !normalized_workspace.as_os_str().is_empty()
+            && normalized_path.starts_with(&normalized_workspace)
+    }
+
+    fn normalize_relative(path: &Path) -> PathBuf {
+        path.components()
+            .filter(|component| !matches!(component, Component::CurDir))
+            .fold(PathBuf::new(), |mut acc, component| {
+                acc.push(component.as_os_str());
+                acc
+            })
     }
 }
 
@@ -84,41 +125,50 @@ impl Tool for EditTool {
     async fn execute(&self, input: Value) -> Result<Value> {
         let file = input["file"].as_str().context("Missing 'file' field")?;
         let action = input["action"].as_str().context("Missing 'action' field")?;
+        let target_path = self.resolve_path(file);
 
         // Block editing system files
         for blocked in BLOCKED_PATHS {
-            if file.starts_with(blocked) {
-                bail!("🛑 SANDBOX: Cannot edit system path: {}", file);
+            if target_path.starts_with(blocked) {
+                bail!(
+                    "🛑 SANDBOX: Cannot edit system path: {}",
+                    target_path.display()
+                );
             }
         }
 
-        // Canonicalization prevents directory traversal (../../etc/passwd) and Symlink escapes
-        if self.workspace != "/" {
-            let canonical_workspace = std::fs::canonicalize(&self.workspace)
-                .unwrap_or_else(|_| std::path::PathBuf::from(&self.workspace));
+        // Canonicalization prevents directory traversal and symlink escapes.
+        let canonical_workspace = std::fs::canonicalize(&self.workspace)
+            .unwrap_or_else(|_| std::path::PathBuf::from(&self.workspace));
+        let absolute_target = Self::absolutize_path(&target_path);
+        let canonical_target = std::fs::canonicalize(&absolute_target).unwrap_or_else(|_| {
+            absolute_target
+                .parent()
+                .and_then(|parent| std::fs::canonicalize(parent).ok())
+                .map(|parent| {
+                    if let Some(name) = absolute_target.file_name() {
+                        parent.join(name)
+                    } else {
+                        parent
+                    }
+                })
+                .unwrap_or(absolute_target)
+        });
 
-            // Try to canonicalize target file. If it doesn't exist yet, canonicalize its parent directory.
-            let path_to_check = std::path::Path::new(file);
-            let canonical_target = std::fs::canonicalize(path_to_check).unwrap_or_else(|_| {
-                path_to_check
-                    .parent()
-                    .and_then(|p| std::fs::canonicalize(p).ok())
-                    .unwrap_or_else(|| std::path::PathBuf::from(file))
+        if self.workspace != "/" && !canonical_target.starts_with(&canonical_workspace) {
+            let err_msg = serde_json::json!({
+                "error_type": "sandbox_violation",
+                "allowed_root": self.workspace,
+                "message": format!("Editing files outside workspace '{}' is not allowed", self.workspace),
+                "suggestion": format!("Use a path starting with {}/", self.workspace)
             });
-
-            if !canonical_target.starts_with(&canonical_workspace) {
-                let err_msg = serde_json::json!({
-                    "error_type": "sandbox_violation",
-                    "allowed_root": self.workspace,
-                    "message": format!("Editing files outside workspace '{}' is not allowed", self.workspace),
-                    "suggestion": format!("Use a path starting with {}/", self.workspace)
-                });
-                anyhow::bail!("{}", err_msg);
-            }
+            anyhow::bail!("{}", err_msg);
         }
 
-        let existing_content = if tokio::fs::try_exists(file).await.unwrap_or(false) {
-            tokio::fs::read_to_string(file).await.unwrap_or_default()
+        let existing_content = if tokio::fs::try_exists(&target_path).await.unwrap_or(false) {
+            tokio::fs::read_to_string(&target_path)
+                .await
+                .unwrap_or_default()
         } else {
             String::new()
         };
@@ -191,22 +241,23 @@ impl Tool for EditTool {
         let term = Term::stderr();
         term.write_line("\n----------------- CODE DIFF PREVIEW -----------------")
             .ok();
-        term.write_line(&format!("File: {}", file)).ok();
+        term.write_line(&format!("File: {}", target_path.display()))
+            .ok();
         term.write_line(&diff_text).ok();
         term.write_line("-----------------------------------------------------")
             .ok();
 
         // Apply string to file
-        if let Some(parent) = std::path::Path::new(file).parent() {
+        if let Some(parent) = target_path.parent() {
             tokio::fs::create_dir_all(parent).await.ok();
         }
-        tokio::fs::write(file, &new_content)
+        tokio::fs::write(&target_path, &new_content)
             .await
-            .with_context(|| format!("Failed to write to file: {}", file))?;
+            .with_context(|| format!("Failed to write to file: {}", target_path.display()))?;
 
         Ok(serde_json::json!({
             "success": true,
-            "message": format!("Successfully applied '{}' to {}", action, file),
+            "message": format!("Successfully applied '{}' to {}", action, target_path.display()),
             "diff": diff_text,
         }))
     }

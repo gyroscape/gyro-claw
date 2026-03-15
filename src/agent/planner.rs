@@ -93,7 +93,52 @@ impl Planner {
              For independent read-only work, you may batch tool calls in this format:\n\
              {\"tools\": [{\"tool\": \"search\", \"args\": {...}}, {\"tool\": \"project_map\", \"args\": {...}}]}\n\
              When calling a tool, respond ONLY with JSON. Do not include explanations, markdown, tool-call tokens, or extra text before or after the JSON object.\n\
-             When you have the final answer, respond normally without JSON.\n\
+             When you have the final answer and have completed all actions, respond normally without JSON.\n\
+             \n\
+             # MANDATORY RULE — FILE CREATION:\n\
+             If the user asks you to create, build, write, or generate ANYTHING, you MUST use the `edit` tool with action `create` to write it to disk inside `./workspace/`.\n\
+             NEVER output raw code as your response. The user needs real files on disk, not printed text.\n\
+             You are NOT done until every file exists on disk and you have verified it.\n\
+             For multi-file projects, create ALL files — never skip any.\n\
+             \n\
+             # YOUR IDENTITY — PRODUCTION-GRADE SOFTWARE ENGINEER:\n\
+             You are an elite full-stack engineer. Every output must be production-worthy — the kind of code shipped by Linear, Vercel, Stripe, and Supabase.\n\
+             You handle EVERYTHING: frontend, backend, CLI tools, APIs, databases, DevOps, mobile, scripts.\n\
+             \n\
+             ## Project Setup (detect and adapt):\n\
+             - **HTML/CSS/JS**: Write self-contained files with COMPLETE inline `<style>` and `<script>` blocks. Never leave CSS empty.\n\
+             - **React/Next.js/Vite**: Scaffold with `shell` + `npx -y`, install shadcn/ui, create full component tree. For `create-*` or install commands, avoid hardcoded low timeouts (like 300). Omit `timeout_secs` or set it close to the configured shell max. If a command times out once, retry with a higher timeout before falling back to manual scaffolding.\n\
+             - **Python/Flask/FastAPI/Django**: Create virtualenv, requirements.txt, proper project structure.\n\
+             - **Rust/Go/Java**: Use cargo/go/gradle init, add deps, create proper module structure.\n\
+             - **Any other**: Detect the stack, scaffold correctly, generate ALL config and source files.\n\
+             \n\
+             ## Code Quality (ALL languages):\n\
+             - Write COMPLETE, WORKING code — never leave TODO placeholders or stub functions.\n\
+             - Proper error handling (try/catch, Result types, error boundaries).\n\
+             - Input validation and sanitization.\n\
+             - Clean architecture: separation of concerns, single responsibility, DRY.\n\
+             - Add comments only where logic is non-obvious.\n\
+             - Follow language idioms (Pythonic Python, idiomatic Rust, modern JS/TS).\n\
+             \n\
+             ## Frontend/UI Quality:\n\
+             When generating ANY user interface, it MUST look like a premium SaaS product:\n\
+             - Dark theme with HSL color palette (no raw hex). Import Google Font Inter.\n\
+             - Glassmorphism cards (backdrop-filter blur, rgba borders).\n\
+             - Micro-animations: hover lift (translateY -2px), press scale(0.97), slideIn for list items, cubic-bezier transitions.\n\
+             - Layered box-shadows for depth. Generous border-radius.\n\
+             - Mobile-first responsive design (Flexbox/Grid).\n\
+             - COMPLETE `<style>` block — EVERY element must be styled. Zero unstyled elements.\n\
+             - For React/Next.js: use shadcn/ui + Tailwind. For vanilla: full CSS in `<style>`.\n\
+             \n\
+             ## Backend/API Quality:\n\
+             - RESTful design with proper HTTP methods and status codes.\n\
+             - Request validation, rate limiting, CORS configuration.\n\
+             - Database migrations, connection pooling, proper ORM usage.\n\
+             - Authentication/authorization patterns where appropriate.\n\
+             - Structured logging, health check endpoints.\n\
+             \n\
+             ## Verification:\n\
+             After creating files, ALWAYS verify by reading them back with `filesystem`. Run tests if applicable.\n\
              \n\
              # IMPORTANT BEHAVIORS:\n\
              1. **Never ask for or try to access passwords or secrets directly.** The system will inject required secrets automatically via {{vault:KEY}} placeholders.\n\
@@ -149,7 +194,20 @@ impl Planner {
              You must strictly follow this interaction sequence:\n\
              Observe (screenshot) -> Decide (detect_ui_elements) -> Act (mouse/keyboard/browser) -> Verify (screenshot).\n\
              Never run detect_ui_elements more than 3 times in a row.\n\
-             If detect_ui_elements fails twice, try clicking near the center of the screen and retry.",
+             If detect_ui_elements fails twice, try clicking near the center of the screen and retry.\n\
+             \n\
+             # SKILLS SYSTEM\n\
+             You have access to reusable skill playbooks via the `skills` tool.\n\
+             Before starting a complex task, use `skills` with action `list` to check if a relevant skill exists.\n\
+             If one matches, use `skills` with action `load` and the skill name to get step-by-step instructions, then follow them.\n\
+             Skills provide battle-tested workflows for common tasks like scaffolding, deployment, and framework setup.\n\
+             \n\
+             # SUB-AGENT DELEGATION (CRITICAL)\n\
+             For complex or multi-step tasks, you should delegate to specialized sub-agents to maintain security and focus:\n\
+             1. **researcher_sub_agent**: Use for finding code, reading files, or searching the web. It is read-only and cannot mutate state.\n\
+             2. **coder_sub_agent**: Use for making code changes, writing files, and running tests once you have a clear plan.\n\
+             3. **browser_sub_agent**: Use for all external web interactions. It is isolated from your local filesystem.\n\
+             Prefer delegation over performing long sequences of primitive tool calls yourself. This provides better isolation and state management.",
         );
 
         Self {
@@ -352,7 +410,62 @@ impl Planner {
             }
 
             // Try to parse as a tool call.
-            let parsed_calls = parse_planner_tool_calls(&response);
+            let mut parsed_calls = parse_planner_tool_calls(&response);
+            
+            // Fallback: if parser returned empty but response likely contains a tool call,
+            // try harder by finding the JSON substring starting with {"tool"
+            if parsed_calls.is_empty() && (response.contains("\"tool\"") && response.contains("\"args\"")) {
+                tracing::info!("Parser returned empty but response contains tool/args keywords, attempting fallback extraction");
+                // Find the start of the JSON tool call
+                if let Some(tool_start) = response.find("{\"tool\"")
+                    .or_else(|| response.find("{ \"tool\""))
+                    .or_else(|| response.find("{\\\"tool\\\""))
+                {
+                    let json_substr = &response[tool_start..];
+                    // Try to parse from this point using serde_json which handles nested strings correctly
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_substr) {
+                        if value.get("tool").is_some() {
+                            let tool = value["tool"].as_str().unwrap_or("").to_string();
+                            let args = value.get("args")
+                                .or_else(|| value.get("arguments"))
+                                .cloned()
+                                .unwrap_or_else(|| serde_json::json!({}));
+                            let normalized = crate::agent::tool_parser::resolve_tool_alias(
+                                &crate::agent::tool_parser::normalize_tool_name(&tool)
+                            ).to_string();
+                            tracing::info!("Fallback extraction succeeded: tool={}", normalized);
+                            parsed_calls = vec![crate::agent::tool_parser::ToolCall {
+                                tool: normalized,
+                                args,
+                            }];
+                        }
+                    } else {
+                        // serde_json failed — the JSON might be truncated or malformed.
+                        // Try a streaming approach: read from tool_start, count braces manually
+                        // accounting for string escapes
+                        tracing::warn!("Fallback serde parse failed, trying manual brace extraction");
+                        if let Some(extracted) = crate::agent::tool_parser::extract_json_object_from(json_substr) {
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(extracted) {
+                                if value.get("tool").is_some() {
+                                    let tool = value["tool"].as_str().unwrap_or("").to_string();
+                                    let args = value.get("args")
+                                        .or_else(|| value.get("arguments"))
+                                        .cloned()
+                                        .unwrap_or_else(|| serde_json::json!({}));
+                                    let normalized = crate::agent::tool_parser::resolve_tool_alias(
+                                        &crate::agent::tool_parser::normalize_tool_name(&tool)
+                                    ).to_string();
+                                    tracing::info!("Manual brace extraction succeeded: tool={}", normalized);
+                                    parsed_calls = vec![crate::agent::tool_parser::ToolCall {
+                                        tool: normalized,
+                                        args,
+                                    }];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if !parsed_calls.is_empty() {
                 conversation_history.push(Message {
                     role: "assistant".to_string(),
@@ -398,12 +511,14 @@ impl Planner {
                 term.clear_last_lines(1).ok();
 
                 if tool_registry.get(&tool_call.tool_name).is_none() {
+                    let suggestions = tool_registry.suggest_tools(&tool_call.tool_name, 3);
                     let unknown_tool_error = serde_json::json!({
                         "status": "error",
                         "error_type": "unknown_tool",
                         "requested_tool": tool_call.tool_name.clone(),
                         "message": "planner requested a tool that is not registered",
-                        "suggestion": "Use one of the available tools listed in the system prompt."
+                        "suggestion": "Use one of the available tools listed in the system prompt.",
+                        "did_you_mean": suggestions
                     });
                     let unknown_text =
                         serde_json::to_string(&unknown_tool_error).unwrap_or_else(|_| {
@@ -1175,6 +1290,15 @@ impl Planner {
                     console::style("Final response ready").dim()
                 ))
                 .ok();
+                
+                // Print the actual response so the user sees why it stopped
+                if !response.trim().is_empty() {
+                    term.write_line("\n--- Agent Response ---").ok();
+                    term.write_line(response.trim()).ok();
+                    term.write_line("----------------------").ok();
+                } else {
+                    term.write_line("\n[Agent returned an empty response]").ok();
+                }
 
                 self.memory
                     .add_conversation_entry("assistant", &response)

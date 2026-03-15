@@ -22,6 +22,8 @@ Gyro-Claw runs locally, lets an AI model plan tasks and call tools, but **never 
 - **🖥️ Computer Control** — Control your desktop via mouse, keyboard, and vision-based UI detection
 - **🌐 Browser Automation** — High-reliability web automation with multi-selector fallbacks and Playwright integration
 - **🩺 UI State Machine** — Strict Observe → Decide → Act → Verify loop to prevent infinite vision loops
+- **🤝 Secure Sub-Agents** — Role-based delegation (Researcher, Coder, Browser) with isolated tool registries to prevent privilege escalation
+- **📜 Reusable Skills** — Specialized instruction sets (Playbooks) for complex tasks like Next.js scaffolding or Rust project setup
 - **🐳 Docker Ready** — Development and production Docker support
 
 ---
@@ -42,12 +44,19 @@ Gyro-Claw runs locally, lets an AI model plan tasks and call tools, but **never 
 │   │   └── task.rs           # Multi-step task state
 │   ├── tools/
 │   │   ├── mod.rs            # Tool trait & registry
+│   │   ├── sub_agents/       # Role-based sub-agent delegation
+│   │   │   ├── mod.rs        # SubAgentFactory trait & SubAgentRole enum
+│   │   │   ├── researcher.rs # Read-only research sub-agent
+│   │   │   ├── coder.rs      # Code editing sub-agent
+│   │   │   └── browser.rs    # Isolated browser sub-agent
 │   │   ├── browser.rs        # Selenium-like browser control with fallbacks
 │   │   ├── playwright.rs     # Integration with Node.js Playwright server
 │   │   ├── computer/         # OS-level control (Mouse, Keyboard, Screenshot)
 │   │   ├── shell.rs          # Shell command execution
 │   │   ├── filesystem.rs     # File read/write/list
-│   │   └── http.rs           # HTTP API requests
+│   │   ├── http.rs           # HTTP API requests
+│   │   ├── skills.rs         # Skill playback management
+│   │   └── skills_tool.rs    # Tool for listing/loading skills
 │   ├── vault/
 │   │   ├── mod.rs            # Vault module
 │   │   └── secrets.rs        # AES-256-GCM encrypted secret storage
@@ -219,6 +228,7 @@ If Playwright is unavailable, the agent falls back to a deterministic Vision wor
 | `git` | Version control: status, diff, log, commit, add, branch |
 | `web_search` | Search the internet via DuckDuckGo |
 | `test_runner`| Run `cargo test`, `build`, `check`, `clippy` |
+| `skills`      | Discover and load reusable step-by-step instruction playbooks |
 
 ---
 
@@ -289,6 +299,93 @@ gyro-claw vault remove MY_API_KEY
 ```
 
 The AI model can reference secrets using `{{vault:KEY_NAME}}` in tool arguments. The executor injects the actual values at runtime — the LLM never sees them.
+
+### ❓ FAQ: Is the Vault Password Safe?
+
+> **Q: If I export `GYRO_CLAW_VAULT_PASSWORD`, can the AI read my secrets?**
+>
+> **No.** Here's why:
+
+| What | Visible to AI? | Why |
+|------|:-:|---|
+| `GYRO_CLAW_VAULT_PASSWORD` (env var) | ❌ | Used only by local Rust code to decrypt the vault. Never sent to the LLM API. |
+| Your actual API key (e.g. `gsk_bb73...`) | ❌ | Encrypted on disk. Injected by the Executor at tool-execution time, then **redacted** from output before the AI sees it. |
+| `{{vault:GYROSCAPE_API_KEY}}` placeholder | ✅ | This is all the AI ever sees — a harmless placeholder string. |
+
+The env var simply lets Gyro-Claw auto-unlock the vault on startup so you don't have to type the password every time. If you prefer, skip the env var and type it manually:
+
+```bash
+cargo run -- chat
+# Prompts: "Enter vault master password: "
+```
+
+---
+
+## 🤝 Sub-Agent Delegation
+
+Gyro-Claw can delegate complex tasks to **specialized sub-agents** that run in isolated sandboxes with restricted tool access. This prevents privilege escalation — even if a sub-agent is compromised by a prompt injection attack, it physically cannot access tools outside its role.
+
+### Sub-Agent Roles
+
+| Role | Tools Available | Blocked Tools |
+|------|----------------|---------------|
+| **Researcher** | `filesystem` (read-only), `search`, `project_map`, `web_search`, `semantic_search` | `shell`, `edit`, `browser`, `http` |
+| **Coder** | `filesystem`, `edit`, `test_runner`, `git`, `search`, `project_map` | `browser`, `shell`, `web_search` |
+| **Browser** | `browser`, `playwright` | `filesystem`, `shell`, `edit`, everything else |
+
+### How It Works
+
+The main agent automatically delegates to sub-agents when appropriate. You don't need to explicitly ask — the agent decides based on the task:
+
+- **Research tasks** (finding code, analyzing patterns) → `researcher_sub_agent`
+- **Code changes** (editing files, running tests) → `coder_sub_agent`
+- **Web browsing** (fetching external pages) → `browser_sub_agent`
+
+### Security Guarantees
+
+- Each sub-agent gets a **separate `ToolRegistry`** with only its allowed tools
+- The **same Executor** mediates all calls, so secret redaction and policy enforcement still apply
+- **Depth limit** (max 2) prevents infinite recursive sub-agent spawning
+- Sub-agents have **tighter iteration and time limits** than the main agent
+
+---
+
+## 📜 Skills System (Playbooks)
+
+Gyro-Claw supports **Skills** — reusable, specialized instruction sets stored as markdown files. When a user request matches a skill's triggers, the agent can load the full playbook to perform complex tasks with high precision.
+
+### How to Use
+
+1. **List Available Skills**:
+   ```bash
+   gyro-claw run "list available skills"
+   ```
+
+2. **Run a Specialized Task**:
+   Simply describe your goal. The agent will automatically detect relevant skills:
+   ```bash
+   gyro-claw run "scaffold a nextjs app with shadcn"
+   ```
+   *(The agent will see the triggers, load the `nextjs-shadcn` skill, and follow the expert playbook.)*
+
+### Creating Custom Skills
+
+Skills are stored in `~/.gyro-claw/skills/` (global) or `./workspace/.skills/` (project-local). Each skill is a folder containing a `SKILL.md` file.
+
+**Example `SKILL.md`:**
+```yaml
+---
+name: my-deployment
+description: Steps to deploy my custom app
+triggers:
+  - deploy
+  - production
+---
+# Instructions
+1. Run build...
+2. Check logs...
+3. Notify team...
+```
 
 ---
 

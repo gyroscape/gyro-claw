@@ -15,6 +15,7 @@
 use anyhow::{bail, Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
 use rand::{rngs::OsRng, RngCore};
+use jsonschema::{Draft, JSONSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -64,7 +65,7 @@ const ALLOWED_SHELL_COMMANDS: &[&str] = &[
     "ls", "cat", "echo", "grep", "pwd", "find", "head", "tail", "wc", "sort", "uniq", "diff",
     "date", "whoami", "env", "which", "file", "mkdir", "cp", "mv", "touch", "tree", "du", "df",
     "uname", "curl", "wget", "ping", "dig", "nslookup", "git", "cargo", "rustc", "npm", "node",
-    "python", "python3", "pip",
+    "python", "python3", "pip", "cd", "npx", "yarn", "pnpm", "bun",
 ];
 
 const REDACTED_VALUE: &str = "[REDACTED_SECRET]";
@@ -211,34 +212,29 @@ impl Executor {
         let tool = match registry.get(tool_name) {
             Some(tool) => tool,
             None => {
+                let suggestions = registry.suggest_tools(tool_name, 3);
                 return Ok(json!({
                     "status": "error",
                     "error_type": "unknown_tool",
                     "requested_tool": raw_tool_name,
                     "normalized_tool": normalized_tool_name,
                     "message": format!("unknown tool after normalization: '{}'", tool_name),
-                    "suggestion": "Use a valid registered tool name or alias."
+                    "suggestion": "Use a valid registered tool name or alias.",
+                    "did_you_mean": suggestions
                 }));
             }
         };
         let tool_secret_policy = tool.secret_policy();
+
+        // Normalize common argument aliases for better tool calling.
+        self.normalize_tool_arguments(tool_name, &mut input);
 
         // Normalize bounding-box click inputs to center-point coordinates.
         if tool_name == "mouse" {
             self.normalize_mouse_click_target(&mut input);
         }
 
-        // Step 3: Check permission policy (allow / ask / deny)
-        if let Err(err) = self.check_permission(tool_name, &input) {
-            return Ok(Self::error_response(
-                tool_name,
-                "permission_denied",
-                err.to_string(),
-                "Switch to autonomous mode or update tool permissions in config.",
-            ));
-        }
-
-        // Step 3.5: Optional Sandbox Path Auto-Correction
+        // Step 3: Optional Sandbox Path Auto-Correction
         if tool_name == "filesystem" || tool_name == "edit" || tool_name == "search" {
             let path_key = if input.get("path").is_some() {
                 "path"
@@ -261,7 +257,22 @@ impl Executor {
             }
         }
 
-        // Step 4: Block dangerous commands
+        // Step 4: Validate tool arguments against the declared JSON schema.
+        if let Some(error_response) = self.validate_tool_input(tool, &input) {
+            return Ok(error_response);
+        }
+
+        // Step 5: Check permission policy (allow / ask / deny)
+        if let Err(err) = self.check_permission(tool_name, &input) {
+            return Ok(Self::error_response(
+                tool_name,
+                "permission_denied",
+                err.to_string(),
+                "Switch to autonomous mode or update tool permissions in config.",
+            ));
+        }
+
+        // Step 6: Block dangerous commands
         if let Err(err) = self.validate_safety(tool_name, &input) {
             return Ok(Self::error_response(
                 tool_name,
@@ -271,7 +282,7 @@ impl Executor {
             ));
         }
 
-        // Step 5: Sandbox shell commands
+        // Step 7: Sandbox shell commands
         if self.sandbox_shell && tool_name == "shell" {
             if let Err(err) = self.validate_shell_sandbox(&input) {
                 return Ok(Self::error_response(
@@ -283,7 +294,7 @@ impl Executor {
             }
         }
 
-        // Step 6: Resolve secrets under strict zero-trust policy.
+        // Step 8: Resolve secrets under strict zero-trust policy.
         let mut taint = SecretTaintContext::default();
         if self.contains_vault_refs(&input) {
             if let Err(err) =
@@ -325,7 +336,21 @@ impl Executor {
             tracing::debug!(tool = tool_name, "[debug suppressed — vault active]");
         }
 
-        let timeout_duration = Duration::from_secs(self.config.execution.tool_timeout_seconds);
+        let mut timeout_duration = Duration::from_secs(self.config.execution.tool_timeout_seconds);
+        if let Some(custom) = input.get("timeout_secs") {
+            let parsed_timeout = if let Some(n) = custom.as_u64() {
+                Some(n)
+            } else if let Some(n) = custom.as_f64() {
+                Some(n as u64)
+            } else if let Some(s) = custom.as_str() {
+                s.parse::<u64>().ok()
+            } else {
+                None
+            };
+            if let Some(t) = parsed_timeout {
+                timeout_duration = Duration::from_secs(t.clamp(1, 300));
+            }
+        }
         let execution_result =
             tokio::time::timeout(timeout_duration, tool.execute(input.clone())).await;
         let output = match execution_result {
@@ -580,6 +605,83 @@ impl Executor {
                 input["y"] = Value::Number((top + h / 2).into());
             }
         }
+    }
+
+    fn normalize_tool_arguments(&self, tool_name: &str, input: &mut Value) {
+        let Some(map) = input.as_object_mut() else {
+            return;
+        };
+
+        fn move_alias(map: &mut serde_json::Map<String, Value>, from: &str, to: &str) {
+            if map.contains_key(to) {
+                return;
+            }
+            if let Some(value) = map.remove(from) {
+                map.insert(to.to_string(), value);
+            }
+        }
+
+        match tool_name {
+            "edit" => {
+                move_alias(map, "path", "file");
+                move_alias(map, "filepath", "file");
+            }
+            "filesystem" => {
+                move_alias(map, "file", "path");
+                move_alias(map, "filepath", "path");
+            }
+            "shell" => {
+                move_alias(map, "cmd", "command");
+            }
+            "search" | "web_search" => {
+                move_alias(map, "pattern", "query");
+                move_alias(map, "text", "query");
+            }
+            "project_map" => {
+                move_alias(map, "path", "directory");
+            }
+            _ => {}
+        }
+    }
+
+    fn validate_tool_input(&self, tool: &dyn crate::tools::Tool, input: &Value) -> Option<Value> {
+        let schema = tool.input_schema();
+        let compiled = match JSONSchema::options()
+            .with_draft(Draft::Draft7)
+            .compile(&schema)
+        {
+            Ok(compiled) => compiled,
+            Err(err) => {
+                tracing::warn!(
+                    tool = tool.name(),
+                    error = %err,
+                    "tool schema failed to compile; skipping validation"
+                );
+                return None;
+            }
+        };
+
+        if let Err(errors) = compiled.validate(input) {
+            let details: Vec<Value> = errors
+                .map(|error| {
+                    json!({
+                        "path": error.instance_path.to_string(),
+                        "error": error.to_string()
+                    })
+                })
+                .collect();
+
+            return Some(json!({
+                "status": "error",
+                "tool": tool.name(),
+                "error_type": "invalid_tool_arguments",
+                "message": "Tool arguments did not match the expected schema.",
+                "validation_errors": details,
+                "expected_schema": schema
+            }));
+        }
+
+        None
     }
 
     /// Validate that the tool input does not contain dangerous commands.

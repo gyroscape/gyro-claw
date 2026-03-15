@@ -494,7 +494,7 @@ fn default_max_task_runtime() -> u64 {
     600
 }
 fn default_max_shell_runtime() -> u64 {
-    60
+    600
 }
 fn default_max_browser_requests() -> usize {
     20
